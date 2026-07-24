@@ -7,6 +7,7 @@ import {
   computeErrorBackoff,
   decideVerdict,
   isPolicyRefusal,
+  reconcileTerminalOutcome,
 } from "../index.ts"
 import {
   advanceIdleTracking,
@@ -308,6 +309,42 @@ describe("decideVerdict", () => {
       result: { pass: false },
     }
     expect(decideVerdict(createRunState(), [external]).action).toBe("continue")
+  })
+})
+
+describe("reconcileTerminalOutcome", () => {
+  // Observed in the wild: a session was marked "stalled", the user kept driving
+  // it manually to a green full run, and the terminal status never updated —
+  // run.json recorded a stall for a session that actually solved.
+  test("a stalled run whose latest full is green reconciles to solved", () => {
+    const run = createRunState()
+    run.status = "stalled"
+    const ledger: LedgerRow[] = [verification("full", true, [], prediction)]
+    expect(reconcileTerminalOutcome(run, ledger)).toBe("solved")
+  })
+
+  test("budget_limited with a green full also reconciles to solved", () => {
+    const run = createRunState()
+    run.status = "budget_limited"
+    expect(reconcileTerminalOutcome(run, [verification("full", true)])).toBe("solved")
+  })
+
+  test("no flip without a green full, and later reds win over earlier greens", () => {
+    const stalled = createRunState()
+    stalled.status = "stalled"
+    expect(reconcileTerminalOutcome(stalled, [verification("targeted", true)])).toBeNull()
+    expect(
+      reconcileTerminalOutcome(stalled, [verification("full", true), verification("full", false)]),
+    ).toBeNull()
+  })
+
+  test("active, solved, and blocked statuses are never touched", () => {
+    const ledger: LedgerRow[] = [verification("full", true)]
+    for (const status of ["active", "solved", "blocked"] as const) {
+      const run = createRunState()
+      run.status = status
+      expect(reconcileTerminalOutcome(run, ledger)).toBeNull()
+    }
   })
 })
 

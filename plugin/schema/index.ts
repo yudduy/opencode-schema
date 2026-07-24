@@ -220,6 +220,23 @@ export function detectSurprise(
   return null
 }
 
+export function reconcileTerminalOutcome(
+  run: RunState,
+  ledger: ParsedLedgerRow[],
+): "solved" | null {
+  // A stall or budget verdict is a judgment about progress at that moment, not
+  // ground truth about the task. If the session was later driven (manually) to
+  // a green full run, the recorded outcome must say solved.
+  if (run.status !== "stalled" && run.status !== "budget_limited") return null
+  for (let index = ledger.length - 1; index >= 0; index -= 1) {
+    const row = ledger[index]
+    if (isVerificationLedgerRow(row) && row.scope === "full") {
+      return row.actual.pass === true ? "solved" : null
+    }
+  }
+  return null
+}
+
 export function decideVerdict(
   run: RunState,
   ledgerTail: ParsedLedgerRow[],
@@ -485,7 +502,15 @@ export const server: Plugin = async ({ client, $, worktree }) => {
       let markedInflight = false
       try {
         const run = await readRun(worktree, sessionID)
-        if (!run || run.status !== "active" || run.inflight) return
+        if (!run || run.inflight) return
+        if (run.status !== "active") {
+          const flipped = reconcileTerminalOutcome(run, await readLedger(worktree, sessionID))
+          if (flipped) {
+            run.status = flipped
+            await writeRun(worktree, sessionID, run)
+          }
+          return
+        }
 
         run.inflight = true
         run.idleCycles = (Number.isFinite(run.idleCycles) ? run.idleCycles : 0) + 1
