@@ -752,7 +752,13 @@ export const server: Plugin = async ({ client, $, worktree }) => {
                     "Full verification failed.",
                 }
               }
-              if (args.scope === "full") run.lastPrediction = null
+              if (args.scope === "full") {
+                run.lastPrediction = null
+                // The outcome is decided here, not at the next idle — one-shot
+                // `opencode run` may exit before the controller ever fires.
+                if (parsed.pass) run.status = "solved"
+                else if (run.status === "solved") run.status = "active"
+              }
               await writeRun(worktree, context.sessionID, run)
               return verificationResult(parsed, run)
             } catch (error) {

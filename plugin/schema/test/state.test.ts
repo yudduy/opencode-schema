@@ -151,6 +151,33 @@ describe("schema tools", () => {
     expect(ledger[0]).not.toHaveProperty("cost")
   })
 
+  test("a green full run stamps solved at the tool site; a later red full un-solves", async () => {
+    // One-shot `opencode run` exits at turn end, so the idle controller may
+    // never fire — the outcome must be recorded the moment it is decided.
+    const directory = await worktree()
+    const sid = "session-solved-stamp"
+    const plugin = await hooks(directory)
+    const ctx = context(directory, sid)
+
+    await plugin.tool!.register_benchmark.execute({ verify_cmd: "bash -c 'exit 0'" }, ctx)
+    await plugin.tool!.predict.execute(
+      { hypothesis: "green", predicted_pass_set: ["benchmark"] },
+      ctx,
+    )
+    await plugin.tool!.run_verify.execute({ scope: "full" }, ctx)
+    expect((await readRun(directory, sid))?.status).toBe("solved")
+
+    const run = await readRun(directory, sid)
+    run!.benchmark!.verify_cmd = "bash -c 'exit 1'"
+    await writeRun(directory, sid, run!)
+    await plugin.tool!.predict.execute(
+      { hypothesis: "still green", predicted_pass_set: ["benchmark"] },
+      ctx,
+    )
+    await plugin.tool!.run_verify.execute({ scope: "full" }, ctx)
+    expect((await readRun(directory, sid))?.status).toBe("active")
+  })
+
   test("serializes concurrent full verification state and ledger steps", async () => {
     const directory = await worktree()
     const sid = "session-concurrent-full"
@@ -217,7 +244,7 @@ describe("schema tools", () => {
     expect(output.status).toBeUndefined()
   })
 
-  test("full-only scoring reports budget metadata without ending the active run", async () => {
+  test("full-only scoring reports budget metadata; a green final full still solves", async () => {
     const directory = await worktree()
     const sid = "session-score"
     const plugin = await hooks(directory)
@@ -241,7 +268,9 @@ describe("schema tools", () => {
 
     const full = await plugin.tool!.run_verify.execute({ scope: "full" }, ctx)
     expect(metadata(full)).toMatchObject({ score: 2.5, status: "budget_limited" })
-    expect((await readRun(directory, sid))?.status).toBe("active")
+    // Solved outranks budget exhaustion — the green full decides the outcome
+    // (same precedence decideVerdict applies).
+    expect((await readRun(directory, sid))?.status).toBe("solved")
 
     const verificationRows = (await readLedger(directory, sid)).filter((row) => row.scope !== "predict")
     expect(verificationRows.map((row) => row.cost)).toEqual([0, 1])
