@@ -1,7 +1,7 @@
 ---
 description: Physicist mode — build an executable world model of the task, falsify it against reality, plan inside it, and spend expensive verification only when the model predicts success.
 mode: primary
-model: openrouter/openai/gpt-5.6-sol-pro
+model: openai-codex/gpt-5.6-sol-pro
 color: "#EA33F7"
 effort: max
 steps: 400
