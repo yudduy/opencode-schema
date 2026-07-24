@@ -81,10 +81,13 @@ export function parseVerifyOutput(
   stderr = "",
   scoreOutput = "",
 ): ParsedVerification {
+  // \b keeps "fail" inside words/paths (e.g. a repo named "ecdsafail") from
+  // reading as a failure marker; zero-count summaries ("0 failed", "0 fail")
+  // appear on fully green cargo/bun runs and are not failures either.
   const failing = `${stdout}\n${stderr}`
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => /FAIL|✗|not ok/i.test(line))
+    .filter((line) => /\bFAIL|✗|\bnot ok\b/i.test(line) && !/\b0\s+fail/i.test(line))
   const score = parseLastScore(scoreOutput)
 
   return {
