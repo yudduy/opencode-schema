@@ -307,7 +307,72 @@ describe("schema tools", () => {
     await expect(readFile(path.join(directory, "budget-marker"), "utf8")).rejects.toBeDefined()
   })
 
-  test("full consumes its prediction while targeted verification preserves it", async () => {
+  // Contract change: ANY observation resolves the open prediction, not just an
+  // expensive one. Coupled to the deny-a-second-prediction gate — if only `full`
+  // resolved, an agent that learned it was wrong from a cheap targeted check could
+  // never record the corrected prediction without first buying a full run, which
+  // deadlocks the "on surprise, stop and repair the model" path.
+  test("surprise fires end-to-end when an assertion is refuted", async () => {
+    // The whole point of the harness, exercised through the real tool path: a run
+    // that PASSES but misses its predicted score must still register as a surprise.
+    // Under the old prose matcher this produced nothing at all.
+    const directory = await worktree()
+    const sid = "session-assertion-surprise"
+    const plugin = await hooks(directory)
+    const ctx = context(directory, sid)
+    await plugin.tool!.register_benchmark.execute(
+      { verify_cmd: "echo 'score: 0.42'", score_cmd: "echo 'score: 0.42'" },
+      ctx,
+    )
+    await plugin.tool!.run_verify.execute({ scope: "characterize" }, ctx)
+    await plugin.tool!.predict.execute(
+      {
+        hypothesis: "the rewrite lands above the target",
+        predicted_pass_set: [],
+        assertions: [{ metric: "score", op: ">=", value: 0.8 }],
+      },
+      ctx,
+    )
+    await plugin.tool!.run_verify.execute({ scope: "full" }, ctx)
+
+    const ledger = await readLedger(directory, sid)
+    const verified = ledger.filter((r: any) => r.scope === "full")
+    expect(verified).toHaveLength(1)
+    expect((verified[0] as any).surprise?.kind).toBe("assertion_failed")
+    expect((verified[0] as any).surprise?.detail).toContain("0.42")
+  })
+
+  test("a second prediction is denied while one is unresolved", async () => {
+    // Kills the predict-storm at its source: measured 1,502 predictions against 56
+    // expensive verifications, with one unbroken streak of 72.
+    const directory = await worktree()
+    const sid = "session-prediction-storm"
+    const plugin = await hooks(directory)
+    const ctx = context(directory, sid)
+    await plugin.tool!.register_benchmark.execute({ verify_cmd: "true" }, ctx)
+
+    await plugin.tool!.predict.execute(
+      { hypothesis: "first", predicted_pass_set: ["a"] },
+      ctx,
+    )
+    expect(metadata(await plugin.tool!.predict.execute(
+      { hypothesis: "second", predicted_pass_set: ["b"] },
+      ctx,
+    ))).toEqual({ error: "prediction_unresolved" })
+
+    // Resolving it re-opens the slot. A successful predict returns a plain string,
+    // so acceptance is asserted on the run state rather than on tool metadata.
+    await plugin.tool!.run_verify.execute({ scope: "targeted" }, ctx)
+    await plugin.tool!.predict.execute(
+      { hypothesis: "third", predicted_pass_set: ["c"] },
+      ctx,
+    )
+    expect((await readRun(directory, sid))?.lastPrediction).toMatchObject({
+      hypothesis: "third",
+    })
+  })
+
+  test("any verification consumes its prediction", async () => {
     const directory = await worktree()
     const sid = "session-prediction-freshness"
     const plugin = await hooks(directory)
@@ -319,8 +384,12 @@ describe("schema tools", () => {
     )
 
     await plugin.tool!.run_verify.execute({ scope: "targeted" }, ctx)
-    expect((await readRun(directory, sid))?.lastPrediction).not.toBeNull()
+    expect((await readRun(directory, sid))?.lastPrediction).toBeNull()
 
+    await plugin.tool!.predict.execute(
+      { hypothesis: "checks pass again", predicted_pass_set: ["benchmark"] },
+      ctx,
+    )
     await plugin.tool!.run_verify.execute({ scope: "full" }, ctx)
     expect((await readRun(directory, sid))?.lastPrediction).toBeNull()
     expect(metadata(await plugin.tool!.run_verify.execute({ scope: "full" }, ctx))).toEqual({
@@ -328,7 +397,7 @@ describe("schema tools", () => {
     })
   })
 
-  test("predict persists side effects and targeted verification persists surprises", async () => {
+  test("predict persists side effects and targeted verification records them in the ledger", async () => {
     const directory = await worktree()
     const sid = "session-targeted-surprise"
     const plugin = await hooks(directory)
@@ -350,9 +419,8 @@ describe("schema tools", () => {
     )
     await plugin.tool!.run_verify.execute({ scope: "targeted" }, ctx)
 
-    expect((await readRun(directory, sid))?.lastPrediction).toMatchObject({
-      predicted_side_effects: "no unrelated failures",
-    })
+    // The prediction is consumed by the observation; the ledger keeps the record.
+    expect((await readRun(directory, sid))?.lastPrediction).toBeNull()
     expect(await readLedger(directory, sid)).toMatchObject([
       {
         scope: "predict",

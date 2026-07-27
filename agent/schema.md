@@ -43,7 +43,7 @@ Every way of checking the world is a *channel* with a **kind**, a **cost**, and 
 
 1. **Observe** the cheap channels already available (types, the last targeted run, the ledger). Read code; use the language server; reason.
 2. **Refine the model** (`world_model.md`) so it still explains every characterization check.
-3. **Predict**: state the next action's intent as `<hypothesis> -> <predicted verdict on a named channel>`. Record it with `predict` before any expensive check.
+3. **Predict**: state the next action's intent as `<hypothesis> -> <predicted verdict on a named channel>`, and record it with `predict` before any expensive check. **Give at least one `assertion`** — a metric, a comparison and a number, e.g. `{metric:"score", op:">=", value:0.8}`. Prose is not a prediction: a sentence cannot be refuted by a machine, so a prose-only prediction is one the harness cannot ever tell you was wrong. The assertion is the part that can fire.
 4. **Verify at the cheapest discriminating scope first.** Run the *single* cheapest check whose outcome separates your live hypotheses — not the whole suite.
 5. **On surprise, STOP.** If the actual outcome falls outside your prediction (a targeted check you expected green is red, or an *unrelated* characterization check flips), abort the plan immediately. Do **not** run the remaining checks. Localize the first wrong assumption in your diff-effect map and repair the model. A surprise is the most valuable event in the loop — it is the system telling you your theory is wrong, cheaply, before you paid for the full run.
 6. **On match, proceed.** Continue the plan, or — only now — spend the expensive full-suite/benchmark run to confirm.
@@ -77,7 +77,9 @@ Run the generalization critic (an independent, adversarial review of your diff a
 
 - `register_benchmark({ verify_cmd, targeted_cmd?, score_cmd?, notes? })` — declare how this task is verified and scored. Call once, before editing.
 - `run_verify({ scope })` where `scope ∈ {characterize, targeted, full}` — run checks at that scope, append the ledger, return pass/fail + failing checks + any score delta. `characterize` captures the baseline; `targeted` is the cheap discriminating run; `full` is the expensive eval you must earn.
-- `predict({ hypothesis, predicted_pass_set, predicted_side_effects })` — record a prediction before an expensive verify. Required before `run_verify({scope:"full"})`.
+- `predict({ hypothesis, assertions, predicted_pass_set, predicted_side_effects })` — record a prediction before an expensive verify. Required before `run_verify({scope:"full"})`.
+  - `assertions` is what makes the prediction falsifiable and is checked automatically against the result: `[{ metric: "score"|"pass"|"failing_count", op: ">="|"<="|">"|"<"|"=="|"!=", value: <number|boolean>, tol?: <number> }]`. State the number you expect *before* you see it — that is the whole discipline. A refuted assertion raises a surprise and you stop.
+  - Only one prediction may be open at a time. Resolve it by running a verification; a second `predict` is denied until you do. If you never test a conjecture, you have learned nothing from it.
 - `record_ad_hoc({ special_case, anomaly, lines_added?, checks_greened? })` — append to the Ad-Hoc Inventory.
 
 Edits to code use the normal editing tools — but they are **gated**: you cannot edit until you have characterized (a green baseline in the ledger), and you cannot spend a full run without a recorded prediction. That gate is the mode enforcing "theory before edits" on you; work with it.

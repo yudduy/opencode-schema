@@ -12,14 +12,29 @@ export type Benchmark = {
   score_cmd?: string
 }
 
+/** A machine-refutable claim about the next verification.
+ *
+ * The original `predicted_pass_set: string[]` was prose, and `detectSurprise`
+ * could only ask whether that prose appeared inside a grepped FAIL line — which
+ * for a claim like "score >= 0.8" it never can. Measured over 121 sessions:
+ * surprise fired on 0.53% of predictions. An assertion states a metric, a
+ * comparison and a literal, so it can simply be evaluated. */
+export type Assertion = {
+  metric: "score" | "pass" | "failing_count"
+  op: ">=" | "<=" | ">" | "<" | "==" | "!="
+  value: number | boolean
+  tol?: number
+}
+
 export type Prediction = {
   hypothesis: string
   predicted_pass_set: string[]
+  assertions?: Assertion[]
   predicted_side_effects?: string
   ts: number
 }
 
-export type SurpriseKind = "predicted_pass_failed" | "side_effect_flip"
+export type SurpriseKind = "predicted_pass_failed" | "side_effect_flip" | "assertion_failed"
 
 export type SurpriseAnnotation = {
   kind: SurpriseKind

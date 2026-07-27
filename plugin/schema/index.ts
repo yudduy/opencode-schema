@@ -21,6 +21,7 @@ import {
   readRun,
   writeRun,
   type ParsedLedgerRow,
+  type Assertion,
   type Prediction,
   type ReviewTrigger,
   type RunState,
@@ -184,11 +185,64 @@ function failureMatchesCheck(check: string, failure: string): boolean {
   )
 }
 
+/** Read the value an assertion refers to out of an observed verification. */
+function actualFor(metric: Assertion["metric"], actual: VerificationLedgerRow["actual"]) {
+  if (metric === "score") return actual.score
+  if (metric === "pass") return actual.pass
+  return actual.failing.length
+}
+
+function compare(op: Assertion["op"], left: number | boolean, right: number | boolean, tol = 0): boolean {
+  if (typeof left === "boolean" || typeof right === "boolean") {
+    const l = Boolean(left)
+    const r = Boolean(right)
+    return op === "!=" ? l !== r : l === r
+  }
+  switch (op) {
+    case ">=": return left >= right - tol
+    case "<=": return left <= right + tol
+    case ">": return left > right - tol
+    case "<": return left < right + tol
+    case "==": return Math.abs(left - right) <= tol
+    case "!=": return Math.abs(left - right) > tol
+  }
+}
+
+/** The refutation step, as an evaluation rather than a string match. */
+export function evaluateAssertions(
+  prediction: { assertions?: Assertion[] },
+  actual: VerificationLedgerRow["actual"],
+): { assertion: Assertion; observed: number | boolean | undefined }[] {
+  const failed: { assertion: Assertion; observed: number | boolean | undefined }[] = []
+  for (const assertion of prediction.assertions ?? []) {
+    const observed = actualFor(assertion.metric, actual)
+    // An assertion about a metric reality did not report is unfalsified, not false —
+    // treating a missing score as a refutation would fire on every un-scored run.
+    if (observed === undefined) continue
+    if (!compare(assertion.op, observed, assertion.value, assertion.tol ?? 0)) {
+      failed.push({ assertion, observed })
+    }
+  }
+  return failed
+}
+
 export function detectSurprise(
   row: VerificationLedgerRow,
   baselineFailing: string[],
 ): SurpriseAnnotation | null {
   if (!row.prediction) return null
+
+  const failedAssertions = evaluateAssertions(row.prediction, row.actual)
+  if (failedAssertions.length > 0) {
+    const { assertion, observed } = failedAssertions[0]
+    return {
+      kind: "assertion_failed",
+      detail:
+        `Predicted ${assertion.metric} ${assertion.op} ${assertion.value}` +
+        `, observed ${observed}` +
+        (failedAssertions.length > 1 ? ` (+${failedAssertions.length - 1} more)` : ""),
+    }
+  }
 
   for (const predicted of row.prediction.predicted_pass_set) {
     const failure = row.actual.failing.find((candidate) =>
@@ -752,8 +806,8 @@ export const server: Plugin = async ({ client, $, worktree }) => {
                     "Full verification failed.",
                 }
               }
+              if (args.scope === "targeted" || args.scope === "full") run.lastPrediction = null
               if (args.scope === "full") {
-                run.lastPrediction = null
                 // The outcome is decided here, not at the next idle — one-shot
                 // `opencode run` may exit before the controller ever fires.
                 if (parsed.pass) run.status = "solved"
@@ -772,6 +826,17 @@ export const server: Plugin = async ({ client, $, worktree }) => {
         args: {
           hypothesis: z.string().min(1),
           predicted_pass_set: z.array(z.string().min(1)),
+          assertions: z
+            .array(
+              z.object({
+                metric: z.enum(["score", "pass", "failing_count"]),
+                op: z.enum([">=", "<=", ">", "<", "==", "!="]),
+                value: z.union([z.number(), z.boolean()]),
+                tol: z.number().optional(),
+              }),
+            )
+            .optional()
+            .describe("Machine-checkable claims about the next verification. These are what make the prediction refutable."),
           predicted_side_effects: z.string().optional(),
         },
         async execute(args, context) {
@@ -779,16 +844,25 @@ export const server: Plugin = async ({ client, $, worktree }) => {
             try {
               const run = await readRun(worktree, context.sessionID)
               if (!run) throw new Error("Register a benchmark before recording a prediction.")
+              if (run.lastPrediction) {
+                return {
+                  title: "Prediction still open",
+                  output:
+                    `A prediction is already open and unresolved: "${run.lastPrediction.hypothesis.slice(0, 120)}". ` +
+                    "Resolve it with run_verify before making another. A conjecture nobody tested is not evidence.",
+                  metadata: { error: "prediction_unresolved" },
+                }
+              }
               const prediction: Prediction = {
                 hypothesis: args.hypothesis,
                 predicted_pass_set: args.predicted_pass_set,
+                ...(args.assertions?.length ? { assertions: args.assertions } : {}),
                 ...(args.predicted_side_effects !== undefined
                   ? { predicted_side_effects: args.predicted_side_effects }
                   : {}),
                 ts: Date.now(),
               }
               run.lastPrediction = prediction
-              run.stallCount = 0
               await appendLedger(worktree, context.sessionID, {
                 ts: Date.now(),
                 scope: "predict",
