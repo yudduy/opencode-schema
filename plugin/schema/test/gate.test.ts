@@ -34,6 +34,29 @@ describe("editGatePredicate", () => {
     expect(editGatePredicate(run, "edit")).toBeNull()
   })
 
+  // Regression: a live probe deadlocked here. The workspace held a .venv symlink
+  // pointing outside the tree, the candidate snapshot refused it, so characterize
+  // could never succeed — and the gate denied every tool that could remove the
+  // symlink. The agent spent its whole wall clock with no legal move and ran zero
+  // evaluations. Both mechanisms were individually correct; composed they trapped.
+  test("releases the gate when characterize fails inside the harness", () => {
+    const run = createRunState()
+    run.characterizeBlocked = true
+    expect(run.characterized).toBe(false)
+    for (const toolName of ["edit", "write", "apply_patch", "bash"]) {
+      expect(editGatePredicate(run, toolName)).toBeNull()
+    }
+  })
+
+  test("holds the gate while characterize has merely not been run", () => {
+    const run = createRunState()
+    expect(run.characterizeBlocked).toBeUndefined()
+    expect(editGatePredicate(run, "edit")).toEqual({
+      status: "deny",
+      reason: CHARACTERIZE_REASON,
+    })
+  })
+
   test("is a no-op without run.json", () => {
     expect(editGatePredicate(null, "edit")).toBeNull()
   })

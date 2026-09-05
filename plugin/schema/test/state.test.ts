@@ -8,6 +8,7 @@ import { server } from "../index.ts"
 import {
   appendLedger,
   createRunState,
+  isVerificationLedgerRow,
   ledgerFile,
   readLedger,
   readRun,
@@ -63,6 +64,9 @@ describe("schema tools", () => {
     expect(createRunState().lastReviewKey).toBeNull()
     expect(createRunState().lastReviewTs).toBe(0)
     expect(createRunState().reviewCount).toBe(0)
+    expect(createRunState().frontier).toEqual([])
+    expect(createRunState().frontierTarget).toBeNull()
+    expect(createRunState().liveCandidate).toBeNull()
 
     const directory = await worktree()
     const sid = "session-legacy-state"
@@ -75,6 +79,9 @@ describe("schema tools", () => {
       lastReviewKey?: string | null
       lastReviewTs?: number
       reviewCount?: number
+      frontier?: unknown[]
+      frontierTarget?: string | null
+      liveCandidate?: unknown
     }
     delete legacy.errorStreak
     delete legacy.policyBlockStreak
@@ -83,6 +90,9 @@ describe("schema tools", () => {
     delete legacy.lastReviewKey
     delete legacy.lastReviewTs
     delete legacy.reviewCount
+    delete legacy.frontier
+    delete legacy.frontierTarget
+    delete legacy.liveCandidate
     await writeFile(runFile(directory, sid), `${JSON.stringify(legacy)}\n`, "utf8")
 
     expect(await readRun(directory, sid)).toMatchObject({
@@ -93,6 +103,9 @@ describe("schema tools", () => {
       lastReviewKey: null,
       lastReviewTs: 0,
       reviewCount: 0,
+      frontier: [],
+      frontierTarget: null,
+      liveCandidate: null,
     })
   })
 
@@ -119,6 +132,49 @@ describe("schema tools", () => {
       context(directory, defaultSid),
     )
     expect((await readRun(directory, defaultSid))?.verifyActionBudget).toBe(12)
+  })
+
+  test("benchmark commands and budget lock after evidence exists", async () => {
+    const directory = await worktree()
+    const sid = "session-registration-lock"
+    const plugin = await hooks(directory)
+    const ctx = context(directory, sid)
+    const registration = {
+      verify_cmd: "true",
+      targeted_cmd: "printf targeted",
+      score_cmd: "printf 'score: 1'",
+      verify_action_budget: 3,
+    }
+
+    await plugin.tool!.register_benchmark.execute(registration, ctx)
+    await plugin.tool!.run_verify.execute({ scope: "characterize" }, ctx)
+    expect(
+      await plugin.tool!.register_benchmark.execute(registration, ctx),
+    ).toBe("Benchmark registered; characterize before editing.")
+
+    const changedCommand = await plugin.tool!.register_benchmark.execute(
+      { ...registration, targeted_cmd: "printf changed" },
+      ctx,
+    )
+    const changedBudget = await plugin.tool!.register_benchmark.execute(
+      { ...registration, verify_action_budget: 4 },
+      ctx,
+    )
+
+    expect(metadata(changedCommand).error).toContain(
+      "locked after evidence exists",
+    )
+    expect(metadata(changedBudget).error).toContain(
+      "locked after evidence exists",
+    )
+    expect(await readRun(directory, sid)).toMatchObject({
+      benchmark: {
+        verify_cmd: "true",
+        targeted_cmd: "printf targeted",
+        score_cmd: "printf 'score: 1'",
+      },
+      verifyActionBudget: 3,
+    })
   })
 
   test("full verification requires a prediction, then increments its counter", async () => {
@@ -223,6 +279,57 @@ describe("schema tools", () => {
     const ledger = await readLedger(directory, sid)
     expect(ledger.map((row) => row.scope)).toEqual(["predict", "full", "predict", "full"])
     expect(ledger.map((row) => row.step)).toEqual([1, 2, 3, 4])
+  })
+
+  test("a proposed frontier does not change the scalar path without a world model", async () => {
+    const directory = await worktree()
+    const sid = "session-no-model-frontier"
+    const plugin = await hooks(directory)
+    const ctx = context(directory, sid)
+    await writeFile(path.join(directory, "program.py"), "base\n")
+    await writeFile(path.join(directory, "variant.py"), "variant\n")
+    await plugin.tool!.register_benchmark.execute(
+      { verify_cmd: 'test -f "$PWD/program.py"' },
+      ctx,
+    )
+    await plugin.tool!.propose.execute(
+      {
+        candidates: [
+          { id: "variant", path: "variant.py", rationale: "alternate bytes" },
+        ],
+      },
+      ctx,
+    )
+    expect(
+      metadata(
+        await plugin.tool!.register_benchmark.execute(
+          { verify_cmd: "true" },
+          ctx,
+        ),
+      ).error,
+    ).toContain("candidate proposals")
+
+    expect(
+      metadata(await plugin.tool!.run_verify.execute({ scope: "full" }, ctx)),
+    ).toEqual({ error: "prediction_required" })
+    for (const hypothesis of ["first", "second"]) {
+      await plugin.tool!.predict.execute(
+        { hypothesis, predicted_pass_set: ["benchmark"] },
+        ctx,
+      )
+      await plugin.tool!.run_verify.execute({ scope: "full" }, ctx)
+    }
+
+    expect((await readRun(directory, sid))?.verifyActionsUsed).toBe(2)
+    expect(await readFile(path.join(directory, "program.py"), "utf8")).toBe(
+      "base\n",
+    )
+    expect(
+      (await readLedger(directory, sid))
+        .filter(isVerificationLedgerRow)
+        .filter((row) => row.scope === "full")
+        .map((row) => row.contentHash),
+    ).toEqual([undefined, undefined])
   })
 
   test("characterize records a failing baseline and opens the edit gate", async () => {

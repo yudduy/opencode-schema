@@ -15,26 +15,78 @@ import {
 import {
   advanceIdleTracking,
   appendLedger,
+  captureCandidateSnapshot,
   createRunState,
+  deleteCandidateSnapshot,
   isVerificationLedgerRow,
   readLedger,
   readRun,
+  readWorldModel,
+  resolveCandidateSnapshot,
   writeRun,
+  writeWorldModel,
   type ParsedLedgerRow,
   type Assertion,
+  type Benchmark,
+  type FrontierCandidate,
   type Prediction,
   type ReviewTrigger,
   type RunState,
   type SurpriseAnnotation,
+  type VerificationActual,
   type VerificationLedgerRow,
+  type WorldModelRegistration,
 } from "./state.ts"
 import { parseVerifyOutput, runBenchmarkCommand } from "./verify.ts"
+import {
+  buildReplayReport,
+  combineSurprises,
+  detectObservationSurprise,
+  distinctOfficialCandidateCount,
+  fullCandidateDedupGate,
+  modeledFrontierGatePredicate,
+  rankNextExperiments,
+  scoreFrontier,
+  worldModelGatePredicate,
+  type FrontierPrediction,
+  type ReplayPrediction,
+  type ReplayReport,
+} from "./mechanisms.ts"
+import {
+  assertWorldModelSandboxAvailable,
+  executeWorldModel,
+  validateWorldModelExecutable,
+} from "./world-model.ts"
+import {
+  inferCanonicalTargetPath,
+  inspectLiveCandidate,
+  installCandidateOverlay,
+  overlayArtifactInSnapshot,
+  readCandidateArtifact,
+  storeCandidateArtifact,
+  type PreservedTarget,
+} from "./frontier.ts"
+
+export {
+  buildReplayReport,
+  combineSurprises,
+  compareVerificationResults,
+  detectObservationSurprise,
+  distinctOfficialCandidateCount,
+  fullCandidateDedupGate,
+  modeledFrontierGatePredicate,
+  obviouslyInvokesVerifier,
+  parseWorldModelOutput,
+  rankNextExperiments,
+  scoreFrontier,
+  worldModelGatePredicate,
+} from "./mechanisms.ts"
 
 export const CHARACTERIZE_REASON =
   "Characterize first: run run_verify({scope:'characterize'}) to capture a green baseline before editing (theory before edits)."
 
 export const SCHEMA_REMINDER =
-  "<schema_reminder>Predict before you verify. Run the cheapest discriminating check first. Stop and repair the model on any surprise. Never spend a full run on a red prediction.</schema_reminder>"
+  "<schema_reminder>With a world model: propose many candidates, score the frontier for free, then officially evaluate only unseen bytes chosen for information. Without a world model: predict before full verification. Replay must stay green.</schema_reminder>"
 
 export const STALL_NUDGE_AT = 3
 export const MAX_IDLE_CYCLES = 500
@@ -53,7 +105,7 @@ const prompts = {
   stall:
     "Three idle cycles produced no new evidence. Reconsider the representation, replace accumulated patches with one simpler rule, then choose a decisive cheap check.",
   continue:
-    "Continue the schema loop: refine the world model, record a prediction, and run the cheapest discriminating check.",
+    "Continue the schema loop: propose distinct candidates, score the frontier for free, and use next_experiment before spending on unseen bytes. Without a world model, record one scalar prediction first.",
   budget:
     "Verification budget exhausted. Stop running checks. Record the strongest confirmed model, unresolved uncertainty, and the next discriminating experiment.",
   error: (detail: string) =>
@@ -82,6 +134,10 @@ const z = tool.schema
 
 export function editGatePredicate(run: RunState | null, toolName: string): EditGateDecision {
   if (!run || run.characterized === true || !gatedTools.has(toolName)) return null
+  // A harness-side snapshot failure is not the agent failing to theorize first.
+  // Keeping the gate shut there is a deadlock: characterize cannot run until the
+  // workspace is repaired, and repair is exactly what the gate forbids.
+  if (run.characterizeBlocked === true) return null
   return { status: "deny", reason: CHARACTERIZE_REASON }
 }
 
@@ -394,21 +450,107 @@ export function composeReviewRequest(
 function toolError(error: unknown): ToolResult {
   const message = error instanceof Error ? error.message : String(error)
   return {
-    title: "Schema tool error",
+    title: `Schema tool error: ${message}`,
     output: message,
     metadata: { error: message },
   }
 }
 
+function registeredVerificationCommands(benchmark: Benchmark): string[] {
+  return [
+    benchmark.verify_cmd,
+    ...(benchmark.targeted_cmd ? [benchmark.targeted_cmd] : []),
+    ...(benchmark.score_cmd ? [benchmark.score_cmd] : []),
+  ]
+}
+
+function benchmarksEqual(left: Benchmark, right: Benchmark): boolean {
+  return (
+    left.verify_cmd === right.verify_cmd &&
+    left.targeted_cmd === right.targeted_cmd &&
+    left.score_cmd === right.score_cmd
+  )
+}
+
+function exceptionMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function replayHistory(
+  worktree: string,
+  sessionID: string,
+  benchmark: Benchmark,
+  worldModel: WorldModelRegistration,
+  ledger: ParsedLedgerRow[],
+  signal?: AbortSignal,
+): Promise<ReplayReport> {
+  const predictions: ReplayPrediction[] = []
+  for (const row of ledger) {
+    if (!isVerificationLedgerRow(row)) continue
+    if (!row.candidate) {
+      predictions.push({
+        step: row.step,
+        actual: row.actual,
+        error: "Candidate snapshot is unavailable for this legacy verification row.",
+      })
+      continue
+    }
+    try {
+      const candidate = await resolveCandidateSnapshot(
+        worktree,
+        sessionID,
+        row.candidate,
+      )
+      const predicted = await executeWorldModel(
+        worktree,
+        worldModel,
+        registeredVerificationCommands(benchmark),
+        candidate,
+        signal,
+      )
+      predictions.push({ step: row.step, actual: row.actual, predicted })
+    } catch (error) {
+      predictions.push({
+        step: row.step,
+        actual: row.actual,
+        error: exceptionMessage(error),
+      })
+    }
+  }
+  return buildReplayReport(predictions)
+}
+
+function replayResult(report: ReplayReport) {
+  return {
+    reproduced: `${report.reproduced}/${report.total}`,
+    green: report.green,
+    rows: report.rows,
+  }
+}
+
+function officiallyEvaluatedHashes(ledger: readonly ParsedLedgerRow[]): string[] {
+  return ledger.flatMap((row) =>
+    row.scope === "full" && typeof row.contentHash === "string"
+      ? [row.contentHash]
+      : [],
+  )
+}
+
 function verificationResult(
   parsed: ReturnType<typeof parseVerifyOutput>,
   run: RunState,
+  predicted?: VerificationActual,
+  surprise?: SurpriseAnnotation | null,
+  details: Record<string, unknown> = {},
 ): ToolResult {
   const result = {
+    ...(predicted ? { predicted } : {}),
     ...parsed,
+    ...(surprise ? { surprise } : {}),
     verifyActionsUsed: run.verifyActionsUsed,
     budget: run.verifyActionBudget,
     ...(run.verifyActionsUsed >= run.verifyActionBudget ? { status: "budget_limited" as const } : {}),
+    ...details,
   }
   return {
     title: "Schema verification",
@@ -693,17 +835,387 @@ export const server: Plugin = async ({ client, $, worktree }) => {
             try {
               const existing = await readRun(worktree, context.sessionID)
               const run = existing ?? createRunState()
-              run.status = "active"
-              run.benchmark = {
+              const benchmark: Benchmark = {
                 verify_cmd: args.verify_cmd,
-                ...(args.targeted_cmd ? { targeted_cmd: args.targeted_cmd } : {}),
+                ...(args.targeted_cmd
+                  ? { targeted_cmd: args.targeted_cmd }
+                  : {}),
                 ...(args.score_cmd ? { score_cmd: args.score_cmd } : {}),
               }
-              if (args.verify_action_budget !== undefined) {
-                run.verifyActionBudget = args.verify_action_budget
+              const verifyActionBudget =
+                args.verify_action_budget ?? run.verifyActionBudget
+              const ledger = existing
+                ? await readLedger(worktree, context.sessionID)
+                : []
+              const benchmarkChanged =
+                !!existing?.benchmark &&
+                !benchmarksEqual(existing.benchmark, benchmark)
+              const budgetChanged =
+                !!existing &&
+                existing.verifyActionBudget !== verifyActionBudget
+              if (
+                existing &&
+                ((ledger.length > 0 &&
+                  (!existing.benchmark ||
+                    benchmarkChanged ||
+                    budgetChanged)) ||
+                  (existing.frontier.length > 0 &&
+                    (!existing.benchmark || benchmarkChanged)))
+              ) {
+                throw new Error(
+                  "Benchmark registration is locked after evidence exists or candidate proposals are registered. Start a new opencode session to change commands; the budget is also locked after evidence.",
+                )
               }
+
+              run.status = "active"
+              run.benchmark = benchmark
+              run.verifyActionBudget = verifyActionBudget
               await writeRun(worktree, context.sessionID, run)
               return "Benchmark registered; characterize before editing."
+            } catch (error) {
+              return toolError(error)
+            }
+          })
+        },
+      }),
+      set_world_model: tool({
+        description:
+          "Declare an executable offline predictor in the worktree. It receives a candidate snapshot path and prints one JSON verifier result.",
+        args: {
+          path: z.string().min(1),
+        },
+        async execute(args, context) {
+          return withLock(`session:${context.sessionID}`, async () => {
+            try {
+              const run = await readRun(worktree, context.sessionID)
+              if (!run?.benchmark) {
+                throw new Error(
+                  "Register a benchmark before declaring a world model.",
+                )
+              }
+              const ledger = await readLedger(worktree, context.sessionID)
+              const unreplayable = ledger.filter(
+                (row) => isVerificationLedgerRow(row) && !row.candidate,
+              )
+              if (unreplayable.length > 0) {
+                throw new Error(
+                  `Cannot declare a world model: ${unreplayable.length} existing verification row(s) lack candidate snapshots. ` +
+                    "These legacy rows cannot be replayed. Continue this session without a world model, or start a new opencode session.",
+                )
+              }
+
+              const validated = await validateWorldModelExecutable(
+                worktree,
+                args.path,
+                registeredVerificationCommands(run.benchmark),
+              )
+              await assertWorldModelSandboxAvailable(worktree)
+              await writeWorldModel(
+                worktree,
+                context.sessionID,
+                validated.registration,
+              )
+
+              const result = {
+                declared: true,
+                worldModel: validated.registration,
+                historyRows: ledger.filter(isVerificationLedgerRow).length,
+                message:
+                  "Run replay_verify() to test the model against every recorded verification.",
+              }
+              return {
+                title: "Schema world model",
+                output: JSON.stringify(result),
+                metadata: result,
+              }
+            } catch (error) {
+              return toolError(error)
+            }
+          })
+        },
+      }),
+      propose: tool({
+        description:
+          "Register several immutable candidate program files for wide, free world-model exploration.",
+        args: {
+          candidates: z
+            .array(
+              z.object({
+                id: z.string().min(1),
+                path: z.string().min(1),
+                rationale: z.string().min(1),
+              }),
+            )
+            .min(1)
+            .max(50),
+        },
+        async execute(args, context) {
+          return withLock(`session:${context.sessionID}`, async () => {
+            try {
+              const run = await readRun(worktree, context.sessionID)
+              if (!run?.benchmark) {
+                throw new Error("Register a benchmark before proposing candidates.")
+              }
+              const existingIds = new Set(run.frontier.map((candidate) => candidate.id))
+              const requestIds = new Set<string>()
+              for (const candidate of args.candidates) {
+                if (existingIds.has(candidate.id) || requestIds.has(candidate.id)) {
+                  throw new Error(
+                    `Candidate id '${candidate.id}' is already registered; use a new id for new bytes.`,
+                  )
+                }
+                requestIds.add(candidate.id)
+              }
+
+              const inferred = run.frontierTarget
+                ? null
+                : await inferCanonicalTargetPath(worktree, run.benchmark)
+              const targetPath =
+                run.frontierTarget ?? inferred?.relativePath
+              if (!targetPath) {
+                throw new Error("Unable to resolve the canonical verifier target.")
+              }
+
+              const proposedAt = Date.now()
+              const additions: FrontierCandidate[] = []
+              for (const candidate of args.candidates) {
+                const stored = await storeCandidateArtifact(
+                  worktree,
+                  context.sessionID,
+                  candidate.path,
+                )
+                additions.push({
+                  id: candidate.id,
+                  path: stored.path,
+                  rationale: candidate.rationale,
+                  contentHash: stored.contentHash,
+                  artifact: stored.artifact,
+                  proposedAt,
+                })
+              }
+              run.frontierTarget = targetPath
+              run.frontier.push(...additions)
+              await writeRun(worktree, context.sessionID, run)
+
+              const result = {
+                proposed: additions.map(
+                  ({ id, path: candidatePath, rationale, contentHash }) => ({
+                    id,
+                    path: candidatePath,
+                    rationale,
+                    contentHash,
+                  }),
+                ),
+                frontierSize: run.frontier.length,
+                targetPath,
+                liveCandidate: run.liveCandidate,
+                ...(inferred ? { inference: inferred.evidence } : {}),
+              }
+              return {
+                title: "Schema candidate frontier",
+                output: JSON.stringify(result),
+                metadata: result,
+              }
+            } catch (error) {
+              return toolError(error)
+            }
+          })
+        },
+      }),
+      score_frontier: tool({
+        description:
+          "Run the declared world model over every proposed candidate. This is free, unlimited, and spends no official budget.",
+        args: {},
+        async execute(_args, context) {
+          return withLock(`session:${context.sessionID}`, () =>
+            withLock("worktree:verification", async () => {
+              try {
+                const run = await readRun(worktree, context.sessionID)
+                if (!run?.benchmark) {
+                  throw new Error("Register a benchmark before scoring candidates.")
+                }
+                const worldModel = await readWorldModel(
+                  worktree,
+                  context.sessionID,
+                )
+                if (!worldModel) {
+                  throw new Error(
+                    "Declare a world model with set_world_model before scoring the frontier.",
+                  )
+                }
+                if (run.frontier.length === 0) {
+                  const result = {
+                    frontier: [],
+                    cost: 0,
+                    verifyActionsUsed: run.verifyActionsUsed,
+                    budget: run.verifyActionBudget,
+                    remaining: Math.max(
+                      0,
+                      run.verifyActionBudget - run.verifyActionsUsed,
+                    ),
+                    liveCandidate: run.liveCandidate,
+                    message:
+                      "The frontier is empty. Call propose(...) with several real candidate files; scoring remains free.",
+                  }
+                  return {
+                    title: "Schema frontier scoring",
+                    output: JSON.stringify(result),
+                    metadata: result,
+                  }
+                }
+                if (!run.frontierTarget) {
+                  throw new Error(
+                    "Frontier target is missing; propose the candidates again in a new session.",
+                  )
+                }
+
+                const predictions: FrontierPrediction[] = []
+                for (const candidate of run.frontier) {
+                  const bytes = await readCandidateArtifact(
+                    worktree,
+                    context.sessionID,
+                    candidate.artifact,
+                    candidate.contentHash,
+                  )
+                  let snapshotReference: string | null = null
+                  try {
+                    snapshotReference = await captureCandidateSnapshot(
+                      worktree,
+                      context.sessionID,
+                    )
+                    const snapshot = await resolveCandidateSnapshot(
+                      worktree,
+                      context.sessionID,
+                      snapshotReference,
+                    )
+                    await overlayArtifactInSnapshot(
+                      snapshot,
+                      bytes,
+                      run.frontierTarget,
+                    )
+                    const predicted = await executeWorldModel(
+                      worktree,
+                      worldModel,
+                      registeredVerificationCommands(run.benchmark),
+                      snapshot,
+                      context.abort,
+                    )
+                    predictions.push({
+                      id: candidate.id,
+                      contentHash: candidate.contentHash,
+                      predicted,
+                    })
+                  } finally {
+                    if (snapshotReference) {
+                      await deleteCandidateSnapshot(
+                        worktree,
+                        context.sessionID,
+                        snapshotReference,
+                      )
+                    }
+                  }
+                }
+
+                const predictedAt = Date.now()
+                const predictionById = new Map(
+                  predictions.map((prediction) => [
+                    prediction.id,
+                    prediction.predicted,
+                  ]),
+                )
+                run.frontier = run.frontier.map((candidate) => ({
+                  ...candidate,
+                  predicted: predictionById.get(candidate.id)!,
+                  predictedAt,
+                }))
+                const ledger = await readLedger(worktree, context.sessionID)
+                const frontier = scoreFrontier(
+                  run.frontier,
+                  predictions,
+                  officiallyEvaluatedHashes(ledger),
+                )
+                await writeRun(worktree, context.sessionID, run)
+                const result = {
+                  frontier,
+                  cost: 0,
+                  verifyActionsUsed: run.verifyActionsUsed,
+                  budget: run.verifyActionBudget,
+                  remaining: Math.max(
+                    0,
+                    run.verifyActionBudget - run.verifyActionsUsed,
+                  ),
+                  liveCandidate: run.liveCandidate,
+                }
+                return {
+                  title: "Schema frontier scoring",
+                  output: JSON.stringify(result),
+                  metadata: result,
+                }
+              } catch (error) {
+                return toolError(error)
+              }
+            }),
+          )
+        },
+      }),
+      next_experiment: tool({
+        description:
+          "Advisory ranking of unseen, model-scored candidates by disagreement or inferred pass/fail-boundary proximity.",
+        args: {},
+        async execute(_args, context) {
+          return withLock(`session:${context.sessionID}`, async () => {
+            try {
+              const run = await readRun(worktree, context.sessionID)
+              if (!run?.benchmark) {
+                throw new Error("Register a benchmark before ranking experiments.")
+              }
+              if (!(await readWorldModel(worktree, context.sessionID))) {
+                throw new Error(
+                  "Declare a world model with set_world_model before ranking experiments.",
+                )
+              }
+              const ledger = await readLedger(worktree, context.sessionID)
+              const evaluatedHashes = officiallyEvaluatedHashes(ledger)
+              const scoredCandidates = run.frontier.filter(
+                (
+                  candidate,
+                ): candidate is FrontierCandidate & {
+                  predicted: VerificationActual
+                } => candidate.predicted !== undefined,
+              )
+              const predictions = scoredCandidates.map((candidate) => ({
+                id: candidate.id,
+                contentHash: candidate.contentHash,
+                predicted: candidate.predicted,
+              }))
+              const scored = scoreFrontier(
+                scoredCandidates,
+                predictions,
+                evaluatedHashes,
+              )
+              const ranking = rankNextExperiments(scored, evaluatedHashes)
+              let message: string | undefined
+              if (run.frontier.length === 0) {
+                message =
+                  "The frontier is empty. Call propose(...) with several genuinely different candidate files."
+              } else if (scoredCandidates.length === 0) {
+                message =
+                  "No candidate has a model prediction yet. Call score_frontier(); scoring is free."
+              } else if (ranking.length === 0) {
+                message =
+                  "Every proposed candidate byte sequence was already officially evaluated. Call propose(...) with new candidate bytes."
+              }
+              const result = {
+                ranking,
+                cost: 0,
+                liveCandidate: run.liveCandidate,
+                ...(message ? { message } : {}),
+              }
+              return {
+                title: "Schema next experiment",
+                output: JSON.stringify(result),
+                metadata: result,
+              }
             } catch (error) {
               return toolError(error)
             }
@@ -714,107 +1226,569 @@ export const server: Plugin = async ({ client, $, worktree }) => {
         description: "Run a characterized, targeted, or full benchmark verification.",
         args: {
           scope: z.enum(["characterize", "targeted", "full"]),
+          candidate: z
+            .string()
+            .optional()
+            .describe("Proposed candidate id to install for an official full run."),
+          niche: z
+            .string()
+            .optional()
+            .describe("Which declared niche this candidate belongs to. Required for a full run once niches exist."),
         },
         async execute(args, context) {
+          return withLock(`session:${context.sessionID}`, () =>
+            withLock("worktree:verification", async () => {
+              let unrecordedSnapshot: string | undefined
+              let installedCandidate:
+                | {
+                    run: RunState
+                    candidate: FrontierCandidate
+                    targetPath: string
+                    previousLive: PreservedTarget
+                  }
+                | undefined
+              let verificationRecorded = false
+              try {
+                const run = await readRun(worktree, context.sessionID)
+                if (!run?.benchmark) {
+                  throw new Error("Register a benchmark before running verification.")
+                }
+                if (args.candidate && args.scope !== "full") {
+                  throw new Error("A proposed candidate may only be selected for a full run.")
+                }
+
+                const ledger = await readLedger(worktree, context.sessionID)
+                const worldModel = await readWorldModel(
+                  worktree,
+                  context.sessionID,
+                )
+                const frontierMode =
+                  args.scope === "full" &&
+                  worldModel !== null
+                let selectedCandidate: FrontierCandidate | undefined
+                let selectedBytes: Buffer | undefined
+                const evaluatedHashes = officiallyEvaluatedHashes(ledger)
+                const proposalGate = modeledFrontierGatePredicate(
+                  args.scope,
+                  worldModel,
+                  args.candidate,
+                  run.frontier,
+                  evaluatedHashes,
+                )
+
+                if (proposalGate) {
+                  const result = {
+                    error: proposalGate.error,
+                    message: proposalGate.reason,
+                    allEvaluated: proposalGate.allEvaluated,
+                    cost: 0,
+                    verifyActionsUsed: run.verifyActionsUsed,
+                    budget: run.verifyActionBudget,
+                    liveCandidate: run.liveCandidate,
+                  }
+                  return {
+                    title: proposalGate.allEvaluated
+                      ? "New candidates required"
+                      : "Proposed candidate required",
+                    output: proposalGate.reason,
+                    metadata: result,
+                  }
+                }
+
+                if (frontierMode) {
+                  selectedCandidate = run.frontier.find(
+                    (candidate) => candidate.id === args.candidate,
+                  )
+                  if (!selectedCandidate) {
+                    throw new Error(
+                      "Modeled-frontier gate admitted an unproposed candidate.",
+                    )
+                  }
+                  if (!run.frontierTarget) {
+                    throw new Error(
+                      "Frontier target is missing; propose the candidates again in a new session.",
+                    )
+                  }
+                  selectedBytes = await readCandidateArtifact(
+                    worktree,
+                    context.sessionID,
+                    selectedCandidate.artifact,
+                    selectedCandidate.contentHash,
+                  )
+                  const duplicate = fullCandidateDedupGate(
+                    selectedCandidate.contentHash,
+                    evaluatedHashes,
+                    run.frontier.map((candidate) => candidate.contentHash),
+                  )
+                  if (duplicate) {
+                    const distinctCandidatesOfficiallyEvaluated =
+                      distinctOfficialCandidateCount(ledger)
+                    const result = {
+                      error: "candidate_already_evaluated",
+                      message: duplicate.reason,
+                      candidateId: selectedCandidate.id,
+                      contentHash: selectedCandidate.contentHash,
+                      allEvaluated: duplicate.allEvaluated,
+                      cost: 0,
+                      verifyActionsUsed: run.verifyActionsUsed,
+                      budget: run.verifyActionBudget,
+                      distinctCandidatesOfficiallyEvaluated,
+                      liveCandidate: run.liveCandidate,
+                    }
+                    return {
+                      title: "Candidate already evaluated",
+                      output: duplicate.reason,
+                      metadata: result,
+                    }
+                  }
+                } else if (args.candidate) {
+                  return {
+                    title: "Candidate unavailable",
+                    output:
+                      "Candidate selection requires both a declared world model and a non-empty proposed frontier.",
+                    metadata: { error: "candidate_unavailable" },
+                  }
+                }
+
+                if (
+                  args.scope === "full" &&
+                  run.verifyActionsUsed >= run.verifyActionBudget
+                ) {
+                  run.status = "budget_limited"
+                  await writeRun(worktree, context.sessionID, run)
+                  return {
+                    title: "Budget exhausted",
+                    output:
+                      "Full-run budget spent. Stop running checks; record the strongest confirmed model.",
+                    metadata: {
+                      error: "budget_exhausted",
+                      verifyActionsUsed: run.verifyActionsUsed,
+                      verifyActionBudget: run.verifyActionBudget,
+                    },
+                  }
+                }
+
+                // The old archive gate remains exactly as before without a declared
+                // world model. In frontier mode, next_experiment remains advisory.
+                if (
+                  args.scope === "full" &&
+                  !frontierMode &&
+                  run.niches.length > 0
+                ) {
+                  if (!args.niche) {
+                    return {
+                      title: "Niche required",
+                      output:
+                        `Declared niches: ${run.niches.map((n) => n.id).join(", ")}. ` +
+                        "Say which one this candidate belongs to: run_verify({scope:'full', niche:'<id>'}).",
+                      metadata: { error: "niche_required" },
+                    }
+                  }
+                  if (!run.niches.some((n) => n.id === args.niche)) {
+                    return {
+                      title: "Unknown niche",
+                      output: `'${args.niche}' is not declared. Declared: ${run.niches.map((n) => n.id).join(", ")}.`,
+                      metadata: { error: "niche_unknown" },
+                    }
+                  }
+                  const unexplored = run.niches
+                    .filter((n) => !run.archive[n.id])
+                    .map((n) => n.id)
+                  if (
+                    unexplored.length > 0 &&
+                    run.archive[args.niche] &&
+                    run.lastVerifiedNiche === args.niche
+                  ) {
+                    return {
+                      title: "Diversity gate",
+                      output:
+                        `Two consecutive expensive runs in '${args.niche}', which already has an elite, ` +
+                        `while ${unexplored.join(", ")} ${unexplored.length === 1 ? "has" : "have"} never been tried. ` +
+                        "Sample a different niche, or improve the cheap evidence for this one first. " +
+                        "Greedy descent on one lineage is what an archive exists to prevent.",
+                      metadata: { error: "diversity_gate", unexplored },
+                    }
+                  }
+                }
+                if (
+                  args.scope === "full" &&
+                  !worldModel &&
+                  !run.lastPrediction
+                ) {
+                  return {
+                    title: "Prediction required",
+                    output: "Call predict before run_verify({scope:'full'}).",
+                    metadata: { error: "prediction_required" },
+                  }
+                }
+
+                if (worldModel && args.scope === "full") {
+                  const replay = await replayHistory(
+                    worktree,
+                    context.sessionID,
+                    run.benchmark,
+                    worldModel,
+                    ledger,
+                    context.abort,
+                  )
+                  const replayGate = worldModelGatePredicate(
+                    args.scope,
+                    worldModel,
+                    replay,
+                  )
+                  if (replayGate) {
+                    return {
+                      title: "World-model replay red",
+                      output: replayGate.reason,
+                      metadata: {
+                        error: "world_model_replay_red",
+                        ...replayResult(replay),
+                        cost: 0,
+                        verifyActionsUsed: run.verifyActionsUsed,
+                        budget: run.verifyActionBudget,
+                      },
+                    }
+                  }
+                }
+
+                let candidateReference: string
+                let predicted: VerificationActual | undefined
+                let previousLive: PreservedTarget | undefined
+                try {
+                  candidateReference = await captureCandidateSnapshot(
+                    worktree,
+                    context.sessionID,
+                  )
+                  unrecordedSnapshot = candidateReference
+                } catch (error) {
+                  // The workspace cannot be snapshotted. Release the edit gate so
+                  // the agent can repair whatever makes it unsnapshottable; the
+                  // gate would otherwise deny the only action that can fix this.
+                  if (args.scope === "characterize" && !run.characterizeBlocked) {
+                    run.characterizeBlocked = true
+                    await writeRun(worktree, context.sessionID, run)
+                  }
+                  throw new Error(
+                    `Candidate snapshot failed before evaluation; no budget was spent: ${exceptionMessage(error)}`,
+                  )
+                }
+
+                if (worldModel) {
+                  try {
+                    const candidateSnapshot = await resolveCandidateSnapshot(
+                      worktree,
+                      context.sessionID,
+                      candidateReference,
+                    )
+                    if (selectedCandidate && selectedBytes && run.frontierTarget) {
+                      await overlayArtifactInSnapshot(
+                        candidateSnapshot,
+                        selectedBytes,
+                        run.frontierTarget,
+                      )
+                    }
+                    predicted = await executeWorldModel(
+                      worktree,
+                      worldModel,
+                      registeredVerificationCommands(run.benchmark),
+                      candidateSnapshot,
+                      context.abort,
+                    )
+                    if (selectedCandidate && selectedBytes && run.frontierTarget) {
+                      previousLive = await installCandidateOverlay(
+                        worktree,
+                        context.sessionID,
+                        selectedBytes,
+                        run.frontierTarget,
+                      )
+                      installedCandidate = {
+                        run,
+                        candidate: selectedCandidate,
+                        targetPath: run.frontierTarget,
+                        previousLive,
+                      }
+                      run.liveCandidate = await inspectLiveCandidate(
+                        worktree,
+                        run.frontierTarget,
+                        selectedCandidate,
+                      )
+                      // The overlay intentionally remains live. Persist it before
+                      // invoking external commands so even an infrastructure error
+                      // cannot leave disk state ahead of run.json.
+                      await writeRun(worktree, context.sessionID, run)
+                    }
+                  } catch (error) {
+                    throw new Error(
+                      `World-model preflight failed before evaluation; no budget was spent: ${exceptionMessage(error)}`,
+                    )
+                  }
+                }
+
+                const command =
+                  args.scope === "targeted"
+                    ? (run.benchmark.targeted_cmd ?? run.benchmark.verify_cmd)
+                    : run.benchmark.verify_cmd
+                const output = await runBenchmarkCommand($, worktree, command)
+                let scoreOutput = ""
+                if (args.scope === "full" && run.benchmark.score_cmd) {
+                  // When the scorer IS the verifier — the common case, since a
+                  // benchmark whose verify.sh already prints the score has nothing
+                  // else to name — running it again buys nothing and costs a second
+                  // metered evaluation. The ledger recorded one full run while the
+                  // meter charged two, so the arm silently ran at half its budget:
+                  // 8 distinct candidates out of K=16, which is exactly the
+                  // "harness explores less" result five experiments reported.
+                  if (run.benchmark.score_cmd === command) {
+                    scoreOutput = `${output.stdout}\n${output.stderr}`
+                  } else {
+                    const score = await runBenchmarkCommand(
+                      $,
+                      worktree,
+                      run.benchmark.score_cmd,
+                    )
+                    scoreOutput = `${score.stdout}\n${score.stderr}`
+                  }
+                }
+                const parsed = parseVerifyOutput(
+                  output.exitCode,
+                  output.stdout,
+                  output.stderr,
+                  scoreOutput,
+                )
+                if (selectedCandidate && run.frontierTarget) {
+                  run.liveCandidate = await inspectLiveCandidate(
+                    worktree,
+                    run.frontierTarget,
+                    selectedCandidate,
+                  )
+                }
+
+                let baselineFailing: string[] = []
+                for (let index = ledger.length - 1; index >= 0; index -= 1) {
+                  const row = ledger[index]
+                  if (
+                    isVerificationLedgerRow(row) &&
+                    row.scope === "characterize"
+                  ) {
+                    baselineFailing = row.actual.failing
+                    break
+                  }
+                }
+                const ts = Date.now()
+                const prediction = run.lastPrediction
+                const distinctCandidatesOfficiallyEvaluated = selectedCandidate
+                  ? new Set([
+                      ...evaluatedHashes,
+                      selectedCandidate.contentHash,
+                    ]).size
+                  : undefined
+                const frontierFields =
+                  selectedCandidate && run.frontierTarget
+                    ? {
+                        candidateId: selectedCandidate.id,
+                        candidatePath: selectedCandidate.path,
+                        contentHash: selectedCandidate.contentHash,
+                        targetPath: run.frontierTarget,
+                        distinctCandidatesOfficiallyEvaluated:
+                          distinctCandidatesOfficiallyEvaluated!,
+                      }
+                    : {}
+                const verificationCandidate: VerificationLedgerRow = {
+                  ts,
+                  step: ledger.length + 1,
+                  scope: args.scope,
+                  candidate: candidateReference,
+                  ...frontierFields,
+                  ...((args.scope === "targeted" ||
+                    args.scope === "full") &&
+                  prediction
+                    ? { prediction }
+                    : {}),
+                  ...(predicted ? { predicted } : {}),
+                  actual: parsed,
+                  cost: args.scope === "full" ? 1 : 0,
+                }
+                const scalarSurprise =
+                  args.scope === "targeted" || args.scope === "full"
+                    ? detectSurprise(
+                        verificationCandidate,
+                        baselineFailing,
+                      )
+                    : null
+                const surprise = combineSurprises(
+                  predicted
+                    ? detectObservationSurprise(predicted, parsed)
+                    : null,
+                  scalarSurprise,
+                )
+
+                if (args.scope === "characterize") run.characterized = true
+                if (args.scope === "full") run.verifyActionsUsed += 1
+                run.stallCount = 0
+                const row = await appendLedger(worktree, context.sessionID, {
+                  ts,
+                  scope: args.scope,
+                  candidate: candidateReference,
+                  ...frontierFields,
+                  ...((args.scope === "targeted" ||
+                    args.scope === "full") &&
+                  prediction
+                    ? { prediction }
+                    : {}),
+                  ...(predicted ? { predicted } : {}),
+                  actual: parsed,
+                  cost: args.scope === "full" ? 1 : 0,
+                  ...(surprise ? { surprise } : {}),
+                })
+                verificationRecorded = true
+                unrecordedSnapshot = undefined
+                if (args.scope === "full" && !parsed.pass) {
+                  run.pendingReview = {
+                    trigger: surprise ? "surprise" : "verify_fail",
+                    key: `${surprise ? "surprise" : "verify_fail"}:${row.step}`,
+                    ts,
+                    detail:
+                      surprise?.detail ||
+                      parsed.failing.slice(0, 3).join("; ").slice(0, 200) ||
+                      "Full verification failed.",
+                  }
+                }
+                if (args.scope === "full" && args.niche) {
+                  run.lastVerifiedNiche = args.niche
+                }
+                if (args.scope === "targeted" || args.scope === "full") {
+                  run.lastPrediction = null
+                }
+                if (args.scope === "full") {
+                  if (parsed.pass) run.status = "solved"
+                  else if (run.status === "solved") run.status = "active"
+                }
+                await writeRun(worktree, context.sessionID, run)
+                return verificationResult(parsed, run, predicted, surprise, {
+                  ...(selectedCandidate
+                    ? {
+                        candidateId: selectedCandidate.id,
+                        contentHash: selectedCandidate.contentHash,
+                        targetPath: run.frontierTarget,
+                        distinctCandidatesOfficiallyEvaluated,
+                        liveCandidate: run.liveCandidate,
+                        previousLive: previousLive
+                          ? {
+                              ...previousLive,
+                              preservedAt: path.posix.join(
+                                ".schema",
+                                context.sessionID,
+                                previousLive.artifact,
+                              ),
+                            }
+                          : undefined,
+                      }
+                    : {}),
+                })
+              } catch (error) {
+                if (installedCandidate && !verificationRecorded) {
+                  const {
+                    run,
+                    candidate,
+                    targetPath,
+                    previousLive,
+                  } = installedCandidate
+                  run.liveCandidate = await inspectLiveCandidate(
+                    worktree,
+                    targetPath,
+                    candidate,
+                  ).catch(() => run.liveCandidate)
+                  await writeRun(
+                    worktree,
+                    context.sessionID,
+                    run,
+                  ).catch(() => {})
+                  const message = exceptionMessage(error)
+                  const preservedAt = path.posix.join(
+                    ".schema",
+                    context.sessionID,
+                    previousLive.artifact,
+                  )
+                  const result = {
+                    error: message,
+                    cost: 0,
+                    verifyActionsUsed: run.verifyActionsUsed,
+                    budget: run.verifyActionBudget,
+                    candidateId: candidate.id,
+                    contentHash: candidate.contentHash,
+                    targetPath,
+                    liveCandidate: run.liveCandidate,
+                    previousLive: {
+                      ...previousLive,
+                      preservedAt,
+                    },
+                  }
+                  return {
+                    title: "Schema verification error",
+                    output:
+                      `${message} Candidate '${candidate.id}' remains live at ${targetPath}; ` +
+                      `the prior bytes are preserved at ${preservedAt}.`,
+                    metadata: result,
+                  }
+                }
+                return toolError(error)
+              } finally {
+                if (unrecordedSnapshot) {
+                  await deleteCandidateSnapshot(
+                    worktree,
+                    context.sessionID,
+                    unrecordedSnapshot,
+                  ).catch(() => {})
+                }
+              }
+            }),
+          )
+        },
+      }),
+      replay_verify: tool({
+        description:
+          "Run the declared world model against every recorded candidate and compare complete predicted observations. Replay is free.",
+        args: {},
+        async execute(_args, context) {
           return withLock(`session:${context.sessionID}`, async () => {
             try {
               const run = await readRun(worktree, context.sessionID)
-              if (!run?.benchmark) throw new Error("Register a benchmark before running verification.")
-              if (
-                args.scope === "full" &&
-                run.verifyActionsUsed >= run.verifyActionBudget
-              ) {
-                run.status = "budget_limited"
-                await writeRun(worktree, context.sessionID, run)
-                return {
-                  title: "Budget exhausted",
-                  output:
-                    "Full-run budget spent. Stop running checks; record the strongest confirmed model.",
-                  metadata: {
-                    error: "budget_exhausted",
-                    verifyActionsUsed: run.verifyActionsUsed,
-                    verifyActionBudget: run.verifyActionBudget,
-                  },
-                }
+              if (!run?.benchmark) {
+                throw new Error("Register a benchmark before replay.")
               }
-              if (args.scope === "full" && !run.lastPrediction) {
-                return {
-                  title: "Prediction required",
-                  output: "Call predict before run_verify({scope:'full'}).",
-                  metadata: { error: "prediction_required" },
-                }
+              const worldModel = await readWorldModel(
+                worktree,
+                context.sessionID,
+              )
+              if (!worldModel) {
+                throw new Error(
+                  "Declare a world model with set_world_model before replay.",
+                )
               }
-
-              const command =
-                args.scope === "targeted"
-                  ? (run.benchmark.targeted_cmd ?? run.benchmark.verify_cmd)
-                  : run.benchmark.verify_cmd
-              const output = await runBenchmarkCommand($, worktree, command)
-              let scoreOutput = ""
-              if (args.scope === "full" && run.benchmark.score_cmd) {
-                const score = await runBenchmarkCommand($, worktree, run.benchmark.score_cmd)
-                scoreOutput = `${score.stdout}\n${score.stderr}`
-              }
-              const parsed = parseVerifyOutput(output.exitCode, output.stdout, output.stderr, scoreOutput)
               const ledger = await readLedger(worktree, context.sessionID)
-              let baselineFailing: string[] = []
-              for (let index = ledger.length - 1; index >= 0; index -= 1) {
-                const row = ledger[index]
-                if (isVerificationLedgerRow(row) && row.scope === "characterize") {
-                  baselineFailing = row.actual.failing
-                  break
-                }
+              const report = await replayHistory(
+                worktree,
+                context.sessionID,
+                run.benchmark,
+                worldModel,
+                ledger,
+                context.abort,
+              )
+              const result = {
+                ...replayResult(report),
+                cost: 0,
+                verifyActionsUsed: run.verifyActionsUsed,
+                budget: run.verifyActionBudget,
+                remaining: Math.max(
+                  0,
+                  run.verifyActionBudget - run.verifyActionsUsed,
+                ),
               }
-              const ts = Date.now()
-              const prediction = run.lastPrediction
-              const candidate: VerificationLedgerRow = {
-                ts,
-                step: ledger.length + 1,
-                scope: args.scope,
-                ...((args.scope === "targeted" || args.scope === "full") && prediction
-                  ? { prediction }
-                  : {}),
-                actual: parsed,
-                cost: args.scope === "full" ? 1 : 0,
+              return {
+                title: "Schema replay verification",
+                output: JSON.stringify(result),
+                metadata: result,
               }
-              const surprise =
-                args.scope === "targeted" || args.scope === "full"
-                  ? detectSurprise(candidate, baselineFailing)
-                  : null
-
-              if (args.scope === "characterize") run.characterized = true
-              if (args.scope === "full") run.verifyActionsUsed += 1
-              run.stallCount = 0
-              const row = await appendLedger(worktree, context.sessionID, {
-                ts,
-                scope: args.scope,
-                ...((args.scope === "targeted" || args.scope === "full") && prediction
-                  ? { prediction }
-                  : {}),
-                actual: parsed,
-                cost: args.scope === "full" ? 1 : 0,
-                ...(surprise ? { surprise } : {}),
-              })
-              if (args.scope === "full" && !parsed.pass) {
-                run.pendingReview = {
-                  trigger: surprise ? "surprise" : "verify_fail",
-                  key: `${surprise ? "surprise" : "verify_fail"}:${row.step}`,
-                  ts,
-                  detail:
-                    surprise?.detail ||
-                    parsed.failing.slice(0, 3).join("; ").slice(0, 200) ||
-                    "Full verification failed.",
-                }
-              }
-              if (args.scope === "targeted" || args.scope === "full") run.lastPrediction = null
-              if (args.scope === "full") {
-                // The outcome is decided here, not at the next idle — one-shot
-                // `opencode run` may exit before the controller ever fires.
-                if (parsed.pass) run.status = "solved"
-                else if (run.status === "solved") run.status = "active"
-              }
-              await writeRun(worktree, context.sessionID, run)
-              return verificationResult(parsed, run)
             } catch (error) {
               return toolError(error)
             }
@@ -822,7 +1796,8 @@ export const server: Plugin = async ({ client, $, worktree }) => {
         },
       }),
       predict: tool({
-        description: "Record a falsifiable prediction before expensive verification.",
+        description:
+          "Record the legacy scalar prediction required before full verification when no world model is declared.",
         args: {
           hypothesis: z.string().min(1),
           predicted_pass_set: z.array(z.string().min(1)),
@@ -876,6 +1851,112 @@ export const server: Plugin = async ({ client, $, worktree }) => {
           })
         },
       }),
+      declare_niches: tool({
+        description:
+          "Declare the behaviour space: the distinct approach families worth exploring for this task.",
+        args: {
+          niches: z
+            .array(z.object({ id: z.string().min(1), description: z.string().min(1) }))
+            .min(2)
+            .max(8),
+        },
+        async execute(args, context) {
+          return withLock(`session:${context.sessionID}`, async () => {
+            try {
+              const run = await readRun(worktree, context.sessionID)
+              if (!run) throw new Error("Register a benchmark before declaring niches.")
+              const seen = new Set<string>()
+              for (const n of args.niches) {
+                if (seen.has(n.id)) throw new Error(`Duplicate niche id '${n.id}'.`)
+                seen.add(n.id)
+              }
+              run.niches = args.niches
+              await writeRun(worktree, context.sessionID, run)
+              return (
+                `Behaviour space: ${args.niches.map((n) => n.id).join(", ")}. ` +
+                "Keep at least one live candidate per niche; sample across them rather than descending on the best."
+              )
+            } catch (error) {
+              return toolError(error)
+            }
+          })
+        },
+      }),
+
+      record_candidate: tool({
+        description: "Insert a scored candidate into the archive. Keeps the best per niche.",
+        args: {
+          niche: z.string().min(1),
+          score: z.number(),
+          summary: z.string().min(1),
+          program_sha: z.string().optional(),
+        },
+        async execute(args, context) {
+          return withLock(`session:${context.sessionID}`, async () => {
+            try {
+              const run = await readRun(worktree, context.sessionID)
+              if (!run) throw new Error("Register a benchmark before recording candidates.")
+              if (run.niches.length && !run.niches.some((n) => n.id === args.niche)) {
+                throw new Error(
+                  `'${args.niche}' is not a declared niche (${run.niches.map((n) => n.id).join(", ")}).`,
+                )
+              }
+              const incumbent = run.archive[args.niche]
+              // Strictly-better insertion, per niche. A candidate that loses globally
+              // can still be the elite of its own region — that is the whole point,
+              // and it is where stepping stones come from.
+              const promoted = !incumbent || args.score > incumbent.score
+              if (promoted) {
+                run.archive[args.niche] = {
+                  niche: args.niche,
+                  score: args.score,
+                  summary: args.summary,
+                  ...(args.program_sha ? { programSha: args.program_sha } : {}),
+                  ts: Date.now(),
+                }
+                await writeRun(worktree, context.sessionID, run)
+              }
+              const covered = Object.keys(run.archive).length
+              const total = run.niches.length || covered
+              return (
+                (promoted
+                  ? `Elite of '${args.niche}' is now ${args.score}.`
+                  : `Kept the incumbent elite of '${args.niche}' (${incumbent!.score} >= ${args.score}).`) +
+                ` Archive covers ${covered}/${total} niches.`
+              )
+            } catch (error) {
+              return toolError(error)
+            }
+          })
+        },
+      }),
+
+      list_archive: tool({
+        description: "Show the current elite per niche and which niches are still empty.",
+        args: {},
+        async execute(_args, context) {
+          try {
+            const run = await readRun(worktree, context.sessionID)
+            if (!run) throw new Error("Register a benchmark first.")
+            if (!run.niches.length) return "No behaviour space declared. Call declare_niches first."
+            const lines = run.niches.map((n) => {
+              const elite = run.archive[n.id]
+              return elite
+                ? `  ${n.id}: ${elite.score} — ${elite.summary.slice(0, 90)}`
+                : `  ${n.id}: EMPTY — ${n.description.slice(0, 90)}`
+            })
+            const empty = run.niches.filter((n) => !run.archive[n.id]).map((n) => n.id)
+            return (
+              `Archive (${Object.keys(run.archive).length}/${run.niches.length} covered):\n` +
+              lines.join("\n") +
+              (empty.length ? `\nUntried: ${empty.join(", ")}. An untried niche is cheaper information than a fifth pass at the champion.` : "")
+            )
+          } catch (error) {
+            return toolError(error)
+          }
+        },
+      }),
+
       record_ad_hoc: tool({
         description: "Record a special case in the worktree ad-hoc inventory.",
         args: {
