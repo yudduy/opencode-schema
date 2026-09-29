@@ -1,0 +1,74 @@
+diff --git a/packages/opencode/src/command/template/metaagent.txt b/packages/opencode/src/command/template/metaagent.txt
+index 241faa135..11508d5c2 100644
+--- a/packages/opencode/src/command/template/metaagent.txt
++++ b/packages/opencode/src/command/template/metaagent.txt
+@@ -4,7 +4,7 @@ User request: $ARGUMENTS
+ 
+ Call the `metaagent` tool to apply it:
+ - Translate the request into a concise `base_prompt` — the thinking lens / review criteria (e.g. "reason from first principles and flag unstated assumptions", "review as David Deutsch would: seek hard-to-vary explanations").
+-- If the user named a reviewer model, pass `model` as "provider/model-id"; otherwise omit it (defaults to google/gemini-3.5-flash).
++- If the user named a reviewer model, pass `model` as "provider/model-id"; otherwise omit it (defaults to openrouter/google/gemini-3.5-flash).
+ - If the user named an effort level (low|medium|high|xhigh|max), pass `effort`.
+ - Use action "set" to enable it. If the user asked to turn it off, call the tool with action "clear" instead.
+ 
+diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
+index e59fefe08..6fe23cf0d 100644
+--- a/packages/opencode/src/plugin/index.ts
++++ b/packages/opencode/src/plugin/index.ts
+@@ -11,6 +11,7 @@ import * as Log from "@opencode-ai/core/util/log"
+ import { createOpencodeClient } from "@opencode-ai/sdk"
+ import { ServerAuth } from "@/server/auth"
+ import { CodexAuthPlugin } from "./codex"
++import { AnthropicAuthPlugin } from "./anthropic"
+ import { Session } from "@/session/session"
+ import { NamedError } from "@opencode-ai/core/util/error"
+ import { CopilotAuthPlugin } from "./github-copilot/copilot"
+@@ -60,6 +61,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Pl
+ // Built-in plugins that are directly imported (not installed from npm)
+ const INTERNAL_PLUGINS: PluginInstance[] = [
+   CodexAuthPlugin,
++  AnthropicAuthPlugin,
+   CopilotAuthPlugin,
+   GitlabAuthPlugin,
+   PoeAuthPlugin,
+diff --git a/packages/opencode/src/session/metaagent.ts b/packages/opencode/src/session/metaagent.ts
+index bf099cc13..9c9512ad3 100644
+--- a/packages/opencode/src/session/metaagent.ts
++++ b/packages/opencode/src/session/metaagent.ts
+@@ -28,8 +28,8 @@ export type Info = Schema.Schema.Type<typeof Info>
+ 
+ // Default reviewer model: a cheap, fast, cross-provider small model.
+ export const DEFAULT_MODEL: ModelRef = {
+-  providerID: ProviderID.make("google"),
+-  modelID: ModelID.make("gemini-3.5-flash"),
++  providerID: ProviderID.make("openrouter"),
++  modelID: ModelID.make("google/gemini-3.5-flash"),
+ }
+ export const DEFAULT_EFFORT: Effort = "medium"
+ 
+diff --git a/packages/opencode/src/tool/metaagent.ts b/packages/opencode/src/tool/metaagent.ts
+index 6fc17b581..84e0ea8bd 100644
+--- a/packages/opencode/src/tool/metaagent.ts
++++ b/packages/opencode/src/tool/metaagent.ts
+@@ -13,7 +13,7 @@ export const Parameters = Schema.Struct({
+       "The reviewer lens / criteria — e.g. 'think in first principles' or 'review as David Deutsch would'. Also injected into the main agent's system prompt so it actually thinks that way.",
+   }),
+   model: Schema.optional(Schema.String).annotate({
+-    description: "Reviewer model as 'provider/model-id' (default google/gemini-3.5-flash)",
++    description: "Reviewer model as 'provider/model-id' (default openrouter/google/gemini-3.5-flash)",
+   }),
+   effort: Schema.optional(Schema.Literals(["low", "medium", "high", "xhigh", "max"])).annotate({
+     description: "Reviewer reasoning effort (default medium)",
+diff --git a/packages/opencode/src/tool/metaagent.txt b/packages/opencode/src/tool/metaagent.txt
+index 9c2cb15e4..6580221f5 100644
+--- a/packages/opencode/src/tool/metaagent.txt
++++ b/packages/opencode/src/tool/metaagent.txt
+@@ -3,7 +3,7 @@ Configure the metacognition layer for this session: a thin "meta agent" that rev
+ Use this tool when the user asks you to think in a particular way or to have your reasoning checked — e.g. "think in first principles", "reason like David Deutsch", "be more rigorous / red-team your thinking", "double-check your reasoning as you go". Translate the user's request into a concise `base_prompt` describing the thinking lens and review criteria.
+ 
+ Actions:
+-- "set": configure the reviewer. `base_prompt` is the lens/criteria (also injected into your own system prompt so you actually think that way). Optional `model` ("provider/model-id", default google/gemini-3.5-flash), `effort` (low|medium|high|xhigh|max, default medium), and `enabled`.
++- "set": configure the reviewer. `base_prompt` is the lens/criteria (also injected into your own system prompt so you actually think that way). Optional `model` ("provider/model-id", default openrouter/google/gemini-3.5-flash), `effort` (low|medium|high|xhigh|max, default medium), and `enabled`.
+ - "get": read the current configuration.
+ - "clear": disable the reviewer for this session.
+ 
